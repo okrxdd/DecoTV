@@ -42,12 +42,15 @@ import {
 import { isLikelyHlsUrl } from '@/lib/player/hls-url';
 import {
   comparePlaybackMetrics,
+  hasMeasuredMediaThroughput,
   isVerifiedPlaybackResult,
 } from '@/lib/player/source-ranking';
 import { SearchResult } from '@/lib/types';
 import { generateCacheKey, globalCache } from '@/lib/unified-cache';
 import {
   getVideoResolutionFromM3u8,
+  type PlaybackMediaType,
+  type VideoSourceFailureKind,
   type VideoSourceTestResult,
 } from '@/lib/utils';
 import { isIOSPlatform, useCast } from '@/hooks/useCast';
@@ -125,6 +128,91 @@ interface HlsAudioTrackSwitchPayload {
 interface AudioTrackSelectorItem {
   trackId: number;
   trackHlsIndex?: number;
+}
+
+interface PlaybackResolveResponse {
+  playbackUrl?: string;
+  resolvedUrl?: string;
+  originalUrl?: string;
+  mediaType?: 'hls' | 'file' | 'page' | 'unknown';
+  resolved?: boolean;
+  proxied?: boolean;
+  error?: string;
+}
+
+type SourceProbeMode = 'idle' | 'auto' | 'manual';
+
+interface SourceProbeProgress {
+  running: boolean;
+  mode: SourceProbeMode;
+  done: number;
+  total: number;
+}
+
+const SOURCE_PROBE_AUTO_CONCURRENCY = 3;
+const SOURCE_PROBE_MANUAL_CONCURRENCY = 2;
+const SOURCE_PROBE_TIMEOUT_MS = 5000;
+const SOURCE_PROBE_MANUAL_TIMEOUT_MS = 10000;
+const INITIAL_PREFER_PROBE_TIMEOUT_MS = 4000;
+const INITIAL_PREFER_MAX_WAIT_MS = 4500;
+const PLAYBACK_STARTUP_FAILOVER_MS = 12000;
+
+function getSourceProbeKey(source: Pick<SearchResult, 'source' | 'id'>) {
+  return `${source.source}-${source.id}`;
+}
+
+function getSourceProbeScopeKey(sources: SearchResult[], episodeIndex: number) {
+  return `${episodeIndex}|${sources.map(getSourceProbeKey).join('|')}`;
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
+
+function inferFailureKind(
+  result: VideoSourceTestResult,
+): VideoSourceFailureKind | undefined {
+  if (result.failureKind) return result.failureKind;
+  const message = result.message || '';
+  if (/超时/.test(message)) return 'timeout';
+  if (/播放清单|manifest/i.test(message)) return 'manifest';
+  if (/分片|frag/i.test(message)) return 'fragment';
+  if (/解码|媒体|media/i.test(message)) return 'media';
+  return result.hasError ? 'unknown' : undefined;
+}
+
+function normalizePlaybackErrorMessage(message: string | undefined): string {
+  const raw = (message || '').trim();
+  if (!raw) return '检测失败';
+  if (/no media url/i.test(raw)) return '播放页中未找到可播放媒体地址';
+  if (/timeout|timed out|abort/i.test(raw)) return '连接超时';
+  if (/failed to fetch|fetch failed|network/i.test(raw)) {
+    return '网络请求失败';
+  }
+  if (/manifest/i.test(raw)) return '播放清单不可访问或格式异常';
+  if (/frag/i.test(raw)) return '媒体分片加载失败，源不稳定';
+  if (/media/i.test(raw)) return '媒体格式不兼容或解码失败';
+  if (/resolver|resolve/i.test(raw)) return '播放地址解析失败';
+  if (/invalid/i.test(raw)) return '播放地址无效';
+  return raw;
+}
+
+function buildSourceProbeFailure(
+  message: string,
+  failureKind: VideoSourceFailureKind,
+  extra: Partial<VideoSourceTestResult> = {},
+): VideoSourceTestResult {
+  return {
+    quality: '未知',
+    loadSpeed: '未知',
+    pingTime: 0,
+    hasError: true,
+    status: 'failed',
+    message: normalizePlaybackErrorMessage(message),
+    failureKind,
+    testedAt: Date.now(),
+    ...extra,
+  };
 }
 
 interface DanmukuSettings {
@@ -680,10 +768,36 @@ function PlayPageClient() {
     return true;
   });
 
-  // 保存优选时的测速结果，避免EpisodeSelector重复测速
-  const [precomputedVideoInfo, setPrecomputedVideoInfo] = useState<
+  // 当前集各播放源的统一测速结果，由首播优选、后台测速和手动测速共同维护。
+  const [sourceVideoInfoMap, setSourceVideoInfoMap] = useState<
     Map<string, VideoSourceTestResult>
   >(new Map());
+  const sourceVideoInfoMapRef = useRef<Map<string, VideoSourceTestResult>>(
+    new Map(),
+  );
+  const [sourceTestingKeys, setSourceTestingKeys] = useState<Set<string>>(
+    new Set(),
+  );
+  const [sourceProbeProgress, setSourceProbeProgress] =
+    useState<SourceProbeProgress>({
+      running: false,
+      mode: 'idle',
+      done: 0,
+      total: 0,
+    });
+  const sourceProbeScopeRef = useRef('');
+  const sourceProbeControllerRef = useRef<AbortController | null>(null);
+  const sourceProbeRunIdRef = useRef(0);
+  const playbackFailureKeysRef = useRef<Set<string>>(new Set());
+  const playbackCanPlayRef = useRef(false);
+  const playbackStartupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const autoSwitchToNextVerifiedSourceRef = useRef<(reason: string) => boolean>(
+    () => false,
+  );
+  const playbackUrlCacheRef = useRef<Map<string, string>>(new Map());
+  const videoUrlResolveSeqRef = useRef(0);
 
   // 折叠状态（仅在 lg 及以上屏幕有效）
   const [isEpisodeSelectorCollapsed, setIsEpisodeSelectorCollapsed] =
@@ -729,6 +843,10 @@ function PlayPageClient() {
     setToast({ show: true, message, type });
   };
 
+  useEffect(() => {
+    sourceVideoInfoMapRef.current = sourceVideoInfoMap;
+  }, [sourceVideoInfoMap]);
+
   const isPrivateLibrarySource = (source: string) =>
     source === 'private_library';
 
@@ -742,18 +860,172 @@ function PlayPageClient() {
 
   const getPrivatePlaybackIdentity = () => {
     const detailValue = detailRef.current;
+    const activeEpisodeUrl =
+      detailValue?.episodes?.[currentEpisodeIndexRef.current] || videoUrl;
+    let activeEpisodeSourceItemId = '';
+
+    if (typeof window !== 'undefined' && activeEpisodeUrl) {
+      try {
+        activeEpisodeSourceItemId =
+          new URL(activeEpisodeUrl, window.location.origin).searchParams.get(
+            'sourceItemId',
+          ) || '';
+      } catch {
+        activeEpisodeSourceItemId = '';
+      }
+    }
+
     const connectorId =
       detailValue?.connector_id ||
       initialPrivateConnectorId ||
       currentIdRef.current.split(':')[0];
     const sourceItemId =
-      detailValue?.source_item_id || initialPrivateSourceItemId;
+      activeEpisodeSourceItemId ||
+      detailValue?.source_item_id ||
+      initialPrivateSourceItemId;
 
     return {
       connectorId,
       sourceItemId,
     };
   };
+
+  const resolvePlaybackSource = useCallback(
+    async (
+      rawUrl: string,
+      sourceKey?: string,
+      signal?: AbortSignal,
+    ): Promise<PlaybackResolveResponse & { playbackUrl: string }> => {
+      const trimmedUrl = (rawUrl || '').trim();
+      if (!trimmedUrl) {
+        return {
+          playbackUrl: '',
+          resolvedUrl: '',
+          originalUrl: '',
+          mediaType: 'unknown',
+          resolved: false,
+          error: '播放地址为空',
+        };
+      }
+
+      const isInternalUrl = (() => {
+        try {
+          const parsed = new URL(
+            trimmedUrl,
+            typeof window !== 'undefined'
+              ? window.location.origin
+              : 'http://localhost',
+          );
+          return (
+            parsed.pathname.startsWith('/api/private-library/') ||
+            parsed.pathname.startsWith('/api/proxy/m3u8-filter') ||
+            parsed.pathname.startsWith('/api/proxy/m3u8-asset') ||
+            parsed.pathname.startsWith('/api/proxy/m3u8')
+          );
+        } catch {
+          return !/^https?:\/\//i.test(trimmedUrl);
+        }
+      })();
+
+      if (isInternalUrl || isPrivateLibrarySource(sourceKey || '')) {
+        return {
+          playbackUrl: trimmedUrl,
+          resolvedUrl: trimmedUrl,
+          originalUrl: trimmedUrl,
+          mediaType: isLikelyHlsUrl(trimmedUrl) ? 'hls' : 'file',
+          resolved: false,
+        };
+      }
+
+      const cacheKey = `${sourceKey || currentSourceRef.current || ''}|${trimmedUrl}`;
+      const cachedUrl = playbackUrlCacheRef.current.get(cacheKey);
+      if (cachedUrl) {
+        return {
+          playbackUrl: cachedUrl,
+          resolvedUrl: cachedUrl,
+          originalUrl: trimmedUrl,
+          mediaType: isLikelyHlsUrl(cachedUrl) ? 'hls' : 'file',
+          resolved: cachedUrl !== trimmedUrl,
+        };
+      }
+
+      const params = new URLSearchParams();
+      params.set('url', trimmedUrl);
+      const effectiveSource = sourceKey || currentSourceRef.current;
+      if (effectiveSource) params.set('source', effectiveSource);
+
+      try {
+        if (typeof window !== 'undefined') {
+          const currentUrl = new URL(window.location.href);
+          const adfilter = currentUrl.searchParams.get('adfilter');
+          if (adfilter) params.set('adfilter', adfilter);
+        }
+      } catch {
+        // ignore
+      }
+
+      try {
+        const response = await fetch(`/api/playback/resolve?${params}`, {
+          cache: 'no-store',
+          signal,
+        });
+        if (!response.ok) {
+          throw new Error(`播放地址解析失败：${response.status}`);
+        }
+
+        const payload = (await response.json()) as PlaybackResolveResponse;
+        const resolvedUrl = payload.playbackUrl || payload.resolvedUrl || '';
+        if (resolvedUrl && payload.mediaType !== 'page') {
+          playbackUrlCacheRef.current.set(cacheKey, resolvedUrl);
+          return {
+            ...payload,
+            playbackUrl: resolvedUrl,
+            resolvedUrl,
+            originalUrl: payload.originalUrl || trimmedUrl,
+            mediaType:
+              payload.mediaType ||
+              (isLikelyHlsUrl(resolvedUrl) ? 'hls' : 'unknown'),
+          };
+        }
+
+        return {
+          ...payload,
+          playbackUrl: resolvedUrl || trimmedUrl,
+          resolvedUrl: resolvedUrl || payload.resolvedUrl || trimmedUrl,
+          originalUrl: payload.originalUrl || trimmedUrl,
+          mediaType: payload.mediaType || 'unknown',
+          error: payload.error || '未解析到可播放媒体地址',
+        };
+      } catch (error) {
+        if (!isAbortError(error)) {
+          console.warn('Resolve playback url failed:', error);
+        }
+        if (isAbortError(error)) throw error;
+      }
+
+      return {
+        playbackUrl: trimmedUrl,
+        resolvedUrl: trimmedUrl,
+        originalUrl: trimmedUrl,
+        mediaType: isLikelyHlsUrl(trimmedUrl) ? 'hls' : 'unknown',
+        resolved: false,
+        error: '无法解析播放地址',
+      };
+    },
+    [],
+  );
+
+  const resolvePlaybackUrl = useCallback(
+    async (
+      rawUrl: string,
+      sourceKey?: string,
+      signal?: AbortSignal,
+    ): Promise<string> => {
+      const resolution = await resolvePlaybackSource(rawUrl, sourceKey, signal);
+      return resolution.playbackUrl || resolution.resolvedUrl || rawUrl || '';
+    },
+    [resolvePlaybackSource],
+  );
 
   const isPrivateEmbyLikeSource =
     isPrivateLibrarySource(currentSource) &&
@@ -1386,20 +1658,273 @@ function PlayPageClient() {
   // 工具函数（Utils）
   // -----------------------------------------------------------------------------
 
+  const getSourceEpisodeUrl = useCallback((source: SearchResult) => {
+    if (!source.episodes || source.episodes.length === 0) return '';
+    return (
+      source.episodes[currentEpisodeIndexRef.current] || source.episodes[0]
+    );
+  }, []);
+
+  const mergeSourceProbeResult = useCallback(
+    (
+      source: SearchResult,
+      result: VideoSourceTestResult,
+      options: { force?: boolean } = {},
+    ) => {
+      const sourceKey = getSourceProbeKey(source);
+      setSourceVideoInfoMap((prev) => {
+        const next = new Map(prev);
+        const previous = next.get(sourceKey);
+        if (
+          !options.force &&
+          previous &&
+          isVerifiedPlaybackResult(previous) &&
+          result.hasError
+        ) {
+          sourceVideoInfoMapRef.current = next;
+          return next;
+        }
+        if (
+          !options.force &&
+          previous &&
+          hasMeasuredMediaThroughput(previous) &&
+          !hasMeasuredMediaThroughput(result) &&
+          result.status === 'partial'
+        ) {
+          sourceVideoInfoMapRef.current = next;
+          return next;
+        }
+        next.set(sourceKey, result);
+        sourceVideoInfoMapRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
+
+  const probePlaybackSource = useCallback(
+    async (
+      source: SearchResult,
+      options: {
+        force?: boolean;
+        timeoutMs?: number;
+        signal?: AbortSignal;
+        track?: boolean;
+      } = {},
+    ): Promise<VideoSourceTestResult> => {
+      const sourceKey = getSourceProbeKey(source);
+      const {
+        force = false,
+        timeoutMs = SOURCE_PROBE_TIMEOUT_MS,
+        signal,
+        track = true,
+      } = options;
+
+      const cached = sourceVideoInfoMapRef.current.get(sourceKey);
+      if (!force && cached) return cached;
+
+      const probeController = new AbortController();
+      const abortFromParent = () => probeController.abort();
+      if (signal?.aborted) {
+        probeController.abort();
+      } else {
+        signal?.addEventListener('abort', abortFromParent, { once: true });
+      }
+      const probeTimer = setTimeout(() => probeController.abort(), timeoutMs);
+
+      if (track) {
+        setSourceTestingKeys((prev) => {
+          const next = new Set(prev);
+          next.add(sourceKey);
+          return next;
+        });
+      }
+
+      try {
+        const episodeUrl = getSourceEpisodeUrl(source);
+        if (!episodeUrl) {
+          const result = buildSourceProbeFailure('没有可用播放地址', 'empty');
+          mergeSourceProbeResult(source, result, { force });
+          return result;
+        }
+
+        const resolution = await resolvePlaybackSource(
+          episodeUrl,
+          source.source,
+          probeController.signal,
+        );
+        if (probeController.signal.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+
+        const playbackUrl = resolution.playbackUrl || resolution.resolvedUrl;
+        const mediaType = (resolution.mediaType ||
+          'unknown') as PlaybackMediaType;
+        if (!playbackUrl || mediaType === 'page') {
+          const result = buildSourceProbeFailure(
+            resolution.error || '未解析到可播放媒体地址',
+            'resolver',
+            {
+              resolvedUrl: playbackUrl || resolution.resolvedUrl,
+              mediaType,
+            },
+          );
+          mergeSourceProbeResult(source, result, { force });
+          return result;
+        }
+
+        const info = await getVideoResolutionFromM3u8(playbackUrl, {
+          timeoutMs,
+          signal: probeController.signal,
+        });
+        if (probeController.signal.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+
+        const result: VideoSourceTestResult = {
+          ...info,
+          resolvedUrl: playbackUrl,
+          mediaType,
+          failureKind: inferFailureKind(info),
+        };
+        mergeSourceProbeResult(source, result, { force });
+        return result;
+      } catch (error) {
+        if (isAbortError(error) || signal?.aborted) {
+          if (signal?.aborted) throw error;
+          const result = buildSourceProbeFailure('连接超时', 'timeout');
+          mergeSourceProbeResult(source, result, { force });
+          return result;
+        }
+
+        const result = buildSourceProbeFailure(
+          error instanceof Error ? error.message : '检测失败',
+          'unknown',
+        );
+        mergeSourceProbeResult(source, result, { force });
+        return result;
+      } finally {
+        clearTimeout(probeTimer);
+        signal?.removeEventListener('abort', abortFromParent);
+        if (track) {
+          setSourceTestingKeys((prev) => {
+            const next = new Set(prev);
+            next.delete(sourceKey);
+            return next;
+          });
+        }
+      }
+    },
+    [getSourceEpisodeUrl, mergeSourceProbeResult, resolvePlaybackSource],
+  );
+
+  const runSourceProbeQueue = useCallback(
+    async (
+      sources: SearchResult[],
+      options: {
+        mode: Exclude<SourceProbeMode, 'idle'>;
+        force?: boolean;
+        concurrency?: number;
+        timeoutMs?: number;
+      },
+    ) => {
+      sourceProbeControllerRef.current?.abort();
+
+      if (sources.length === 0) {
+        setSourceProbeProgress({
+          running: false,
+          mode: 'idle',
+          done: 0,
+          total: 0,
+        });
+        return;
+      }
+
+      const runId = ++sourceProbeRunIdRef.current;
+      const controller = new AbortController();
+      sourceProbeControllerRef.current = controller;
+      const total = sources.length;
+      let done = 0;
+      let nextIndex = 0;
+      const concurrency = Math.max(
+        1,
+        Math.min(options.concurrency || 2, sources.length),
+      );
+
+      setSourceProbeProgress({
+        running: true,
+        mode: options.mode,
+        done: 0,
+        total,
+      });
+
+      const updateProgress = () => {
+        if (sourceProbeRunIdRef.current !== runId) return;
+        setSourceProbeProgress({
+          running: done < total && !controller.signal.aborted,
+          mode: options.mode,
+          done,
+          total,
+        });
+      };
+
+      const worker = async () => {
+        while (!controller.signal.aborted) {
+          const sourceIndex = nextIndex++;
+          if (sourceIndex >= sources.length) return;
+
+          const source = sources[sourceIndex];
+          try {
+            await probePlaybackSource(source, {
+              force: options.force,
+              timeoutMs: options.timeoutMs,
+              signal: controller.signal,
+            });
+          } catch (error) {
+            if (!isAbortError(error) && !controller.signal.aborted) {
+              console.warn('Source probe failed:', error);
+            }
+          } finally {
+            done += 1;
+            updateProgress();
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+      if (sourceProbeRunIdRef.current === runId) {
+        setSourceProbeProgress({
+          running: false,
+          mode: options.mode,
+          done: total,
+          total,
+        });
+      }
+    },
+    [probePlaybackSource],
+  );
+
+  const handleManualSourceSpeedTest = useCallback(async () => {
+    await runSourceProbeQueue(availableSources, {
+      mode: 'manual',
+      force: true,
+      concurrency: SOURCE_PROBE_MANUAL_CONCURRENCY,
+      timeoutMs: SOURCE_PROBE_MANUAL_TIMEOUT_MS,
+    });
+  }, [availableSources, runSourceProbeQueue]);
+
   // 播放源优选函数
   const preferBestSource = async (
     sources: SearchResult[],
   ): Promise<SearchResult> => {
     if (sources.length === 1) return sources[0];
-    const autoProbeTimeoutMs = 6500;
-    const acceptableStartupMs = 4500;
-
-    const getTestEpisodeUrl = (source: SearchResult) => {
-      if (!source.episodes || source.episodes.length === 0) return '';
-      return (
-        source.episodes[currentEpisodeIndexRef.current] || source.episodes[0]
-      );
-    };
+    sourceProbeScopeRef.current = getSourceProbeScopeKey(
+      sources,
+      currentEpisodeIndexRef.current,
+    );
+    const autoProbeTimeoutMs = INITIAL_PREFER_PROBE_TIMEOUT_MS;
+    const acceptableStartupMs = INITIAL_PREFER_PROBE_TIMEOUT_MS;
 
     // 自动优选只需要尽快找到经过媒体分片验证的可播源，避免首播前阻塞在全量测速。
     const concurrency = Math.min(3, sources.length);
@@ -1410,47 +1935,43 @@ function PlayPageClient() {
     }> = [];
     let nextSourceIndex = 0;
     let hasAcceptableResult = false;
+    const deadlineTimer = setTimeout(() => {
+      controller.abort();
+    }, INITIAL_PREFER_MAX_WAIT_MS);
 
     const probeSource = async (source: SearchResult) => {
-      const episodeUrl = getTestEpisodeUrl(source);
-      if (!episodeUrl) {
-        return {
-          source,
-          testResult: {
-            quality: '未知',
-            loadSpeed: '未知',
-            pingTime: 0,
-            hasError: true,
-            status: 'failed',
-            message: '没有可用播放地址',
-          } satisfies VideoSourceTestResult,
-        };
-      }
-
-      const testResult = await getVideoResolutionFromM3u8(episodeUrl, {
+      const testResult = await probePlaybackSource(source, {
+        force: true,
         timeoutMs: autoProbeTimeoutMs,
         signal: controller.signal,
+        track: false,
       });
       return { source, testResult };
     };
 
     const runProbeWorker = async () => {
-      while (!hasAcceptableResult) {
+      while (!hasAcceptableResult && !controller.signal.aborted) {
         const sourceIndex = nextSourceIndex++;
         if (sourceIndex >= sources.length) return;
 
-        const result = await probeSource(sources[sourceIndex]);
-        if (controller.signal.aborted && hasAcceptableResult) return;
-        allResults.push(result);
+        try {
+          const result = await probeSource(sources[sourceIndex]);
+          if (controller.signal.aborted && hasAcceptableResult) return;
+          allResults.push(result);
 
-        if (
-          isVerifiedPlaybackResult(result.testResult) &&
-          (result.testResult.startupTimeMs || Number.POSITIVE_INFINITY) <=
-            acceptableStartupMs
-        ) {
-          hasAcceptableResult = true;
-          controller.abort();
-          return;
+          if (
+            isVerifiedPlaybackResult(result.testResult) &&
+            (result.testResult.startupTimeMs || Number.POSITIVE_INFINITY) <=
+              acceptableStartupMs
+          ) {
+            hasAcceptableResult = true;
+            controller.abort();
+            return;
+          }
+        } catch (error) {
+          if (!isAbortError(error)) {
+            console.warn('播放源优选探测失败:', error);
+          }
         }
       }
     };
@@ -1458,20 +1979,12 @@ function PlayPageClient() {
     await Promise.all(
       Array.from({ length: concurrency }, () => runProbeWorker()),
     );
-
-    // 保存已实际探测的结果，未探测的源交由用户主动全量测速。
-    const newVideoInfoMap = new Map<string, VideoSourceTestResult>();
-    allResults.forEach((result) => {
-      const sourceKey = `${result.source.source}-${result.source.id}`;
-      newVideoInfoMap.set(sourceKey, result.testResult);
-    });
+    clearTimeout(deadlineTimer);
 
     // 只有取得媒体分片或明确进入可播状态的数据，才具备自动选中的证据。
     const verifiedResults = allResults.filter((result) =>
       isVerifiedPlaybackResult(result.testResult),
     );
-
-    setPrecomputedVideoInfo(newVideoInfoMap);
 
     if (verifiedResults.length === 0) {
       console.warn('未找到经过媒体验证的播放源，使用默认播放源');
@@ -1496,8 +2009,52 @@ function PlayPageClient() {
     return rankedResults[0].source;
   };
 
+  const availableSourceSignature = useMemo(
+    () => availableSources.map(getSourceProbeKey).join('|'),
+    [availableSources],
+  );
+
+  useEffect(() => {
+    if (loading || availableSources.length === 0) return;
+
+    const scopeKey = getSourceProbeScopeKey(
+      availableSources,
+      currentEpisodeIndex,
+    );
+    if (sourceProbeScopeRef.current !== scopeKey) {
+      sourceProbeScopeRef.current = scopeKey;
+      sourceProbeControllerRef.current?.abort();
+      sourceVideoInfoMapRef.current = new Map();
+      setSourceVideoInfoMap(new Map());
+      setSourceTestingKeys(new Set());
+      setSourceProbeProgress({
+        running: false,
+        mode: 'idle',
+        done: 0,
+        total: availableSources.length,
+      });
+    }
+
+    void runSourceProbeQueue(availableSources, {
+      mode: 'auto',
+      force: false,
+      concurrency: SOURCE_PROBE_AUTO_CONCURRENCY,
+      timeoutMs: SOURCE_PROBE_TIMEOUT_MS,
+    });
+
+    return () => {
+      sourceProbeControllerRef.current?.abort();
+    };
+  }, [
+    availableSourceSignature,
+    availableSources,
+    currentEpisodeIndex,
+    loading,
+    runSourceProbeQueue,
+  ]);
+
   // 更新视频地址
-  const updateVideoUrl = (
+  const updateVideoUrl = async (
     detailData: SearchResult | null,
     episodeIndex: number,
   ) => {
@@ -1509,7 +2066,18 @@ function PlayPageClient() {
       setVideoUrl('');
       return;
     }
-    const newUrl = detailData?.episodes[episodeIndex] || '';
+    const rawUrl = detailData?.episodes[episodeIndex] || '';
+    if (!rawUrl) {
+      setVideoUrl('');
+      return;
+    }
+
+    const resolveSeq = ++videoUrlResolveSeqRef.current;
+    const newUrl = await resolvePlaybackUrl(rawUrl, detailData.source);
+    if (resolveSeq !== videoUrlResolveSeqRef.current) {
+      return;
+    }
+
     if (newUrl !== videoUrl) {
       setVideoUrl(newUrl);
     }
@@ -1901,6 +2469,10 @@ function PlayPageClient() {
   // 清理播放器资源的统一函数
   const cleanupPlayer = () => {
     cleanupMobileMouseSeekPatch();
+    if (playbackStartupTimerRef.current) {
+      clearTimeout(playbackStartupTimerRef.current);
+      playbackStartupTimerRef.current = null;
+    }
 
     // Clean up DecoDock features and theme before destroying the player
     countdownCleanupRef.current?.();
@@ -2123,8 +2695,42 @@ function PlayPageClient() {
 
   // 当集数索引变化时自动更新视频地址
   useEffect(() => {
-    updateVideoUrl(detail, currentEpisodeIndex);
+    void updateVideoUrl(detail, currentEpisodeIndex);
   }, [detail, currentEpisodeIndex]);
+
+  useEffect(() => {
+    if (playbackStartupTimerRef.current) {
+      clearTimeout(playbackStartupTimerRef.current);
+      playbackStartupTimerRef.current = null;
+    }
+
+    playbackCanPlayRef.current = false;
+    playbackFailureKeysRef.current.delete(
+      `${currentSource}-${currentId}-${currentEpisodeIndex}`,
+    );
+
+    if (!videoUrl || loading || isPrivateLibrarySource(currentSource)) {
+      return;
+    }
+
+    playbackStartupTimerRef.current = setTimeout(() => {
+      if (playbackCanPlayRef.current) return;
+      const player = artPlayerRef.current;
+      const hasStarted =
+        Number(player?.currentTime || 0) > 0 ||
+        Number(player?.duration || 0) > 0;
+      if (hasStarted) return;
+
+      autoSwitchToNextVerifiedSourceRef.current('首片加载超时，未取得媒体分片');
+    }, PLAYBACK_STARTUP_FAILOVER_MS);
+
+    return () => {
+      if (playbackStartupTimerRef.current) {
+        clearTimeout(playbackStartupTimerRef.current);
+        playbackStartupTimerRef.current = null;
+      }
+    };
+  }, [currentEpisodeIndex, currentId, currentSource, loading, videoUrl]);
 
   // 进入页面时直接获取全部源信息
   useEffect(() => {
@@ -2433,6 +3039,82 @@ function PlayPageClient() {
       setError(err instanceof Error ? err.message : '换源失败');
     }
   };
+
+  useEffect(() => {
+    autoSwitchToNextVerifiedSourceRef.current = (reason: string) => {
+      const activeSource = currentSourceRef.current;
+      const activeId = currentIdRef.current;
+      const episodeIndex = currentEpisodeIndexRef.current;
+      if (!activeSource || !activeId || isPrivateLibrarySource(activeSource)) {
+        return false;
+      }
+
+      const currentFailureKey = `${activeSource}-${activeId}-${episodeIndex}`;
+      if (playbackFailureKeysRef.current.has(currentFailureKey)) {
+        return false;
+      }
+      playbackFailureKeysRef.current.add(currentFailureKey);
+
+      const currentDetail = availableSources.find(
+        (source) => source.source === activeSource && source.id === activeId,
+      );
+      if (currentDetail) {
+        mergeSourceProbeResult(
+          currentDetail,
+          buildSourceProbeFailure(reason, 'fragment', {
+            resolvedUrl: videoUrl,
+            mediaType: isLikelyHlsUrl(videoUrl) ? 'hls' : 'unknown',
+          }),
+          { force: true },
+        );
+      }
+
+      const candidates = availableSources
+        .filter((source) => {
+          if (source.source === activeSource && source.id === activeId) {
+            return false;
+          }
+          if (!source.episodes?.[episodeIndex] && !source.episodes?.[0]) {
+            return false;
+          }
+          const failureKey = `${source.source}-${source.id}-${episodeIndex}`;
+          if (playbackFailureKeysRef.current.has(failureKey)) return false;
+          return isVerifiedPlaybackResult(
+            sourceVideoInfoMapRef.current.get(getSourceProbeKey(source)),
+          );
+        })
+        .sort((a, b) =>
+          comparePlaybackMetrics(
+            sourceVideoInfoMapRef.current.get(getSourceProbeKey(a)),
+            sourceVideoInfoMapRef.current.get(getSourceProbeKey(b)),
+          ),
+        );
+
+      const nextSource = candidates[0];
+      if (!nextSource) {
+        setIsVideoLoading(false);
+        setError(reason || '当前播放源不可用，暂无已验证可播放的备用源');
+        return false;
+      }
+
+      const currentPlayTime = artPlayerRef.current?.currentTime || 0;
+      if (currentPlayTime > 1) {
+        resumeTimeRef.current = currentPlayTime;
+      }
+      setVideoLoadingStage('sourceChanging');
+      setIsVideoLoading(true);
+      showToast(
+        `当前源播放失败，已自动切换到 ${nextSource.source_name}`,
+        'info',
+      );
+      void handleSourceChange(
+        nextSource.source,
+        nextSource.id,
+        nextSource.title,
+      );
+      return true;
+    };
+  });
 
   useEffect(() => {
     document.addEventListener('keydown', handleKeyboardShortcuts);
@@ -3039,6 +3721,8 @@ function PlayPageClient() {
             video.hls = hls;
 
             ensureVideoSource(video, url);
+            let networkRecoveryCount = 0;
+            let mediaRecoveryCount = 0;
 
             hls.on(
               Hls.Events.AUDIO_TRACKS_UPDATED,
@@ -3126,18 +3810,44 @@ function PlayPageClient() {
             hls.on(Hls.Events.ERROR, function (event: any, data: any) {
               console.error('HLS Error:', event, data);
               if (data.fatal) {
+                const details = String(data?.details || '');
+                const failFast =
+                  /manifest|levelLoadError|levelLoadTimeOut|keyLoadError/i.test(
+                    details,
+                  );
+                const message = /manifest/i.test(details)
+                  ? '播放清单不可访问或格式异常'
+                  : /frag/i.test(details)
+                    ? '媒体分片加载失败，源不稳定'
+                    : /buffer|media/i.test(details)
+                      ? '浏览器解码失败，源可能不兼容'
+                      : 'HLS 加载失败';
+
                 switch (data.type) {
                   case Hls.ErrorTypes.NETWORK_ERROR:
-                    console.log('网络错误，尝试恢复...');
-                    hls.startLoad();
+                    if (!failFast && networkRecoveryCount < 1) {
+                      networkRecoveryCount += 1;
+                      console.log('网络错误，尝试恢复...');
+                      hls.startLoad();
+                      return;
+                    }
+                    hls.destroy();
+                    autoSwitchToNextVerifiedSourceRef.current(message);
                     break;
                   case Hls.ErrorTypes.MEDIA_ERROR:
-                    console.log('媒体错误，尝试恢复...');
-                    hls.recoverMediaError();
+                    if (mediaRecoveryCount < 1) {
+                      mediaRecoveryCount += 1;
+                      console.log('媒体错误，尝试恢复...');
+                      hls.recoverMediaError();
+                      return;
+                    }
+                    hls.destroy();
+                    autoSwitchToNextVerifiedSourceRef.current(message);
                     break;
                   default:
                     console.log('无法恢复的错误');
                     hls.destroy();
+                    autoSwitchToNextVerifiedSourceRef.current(message);
                     break;
                 }
               }
@@ -3433,6 +4143,12 @@ function PlayPageClient() {
 
       // 监听视频可播放事件，这时恢复播放进度更可靠
       artPlayerRef.current.on('video:canplay', () => {
+        playbackCanPlayRef.current = true;
+        if (playbackStartupTimerRef.current) {
+          clearTimeout(playbackStartupTimerRef.current);
+          playbackStartupTimerRef.current = null;
+        }
+
         // 若存在需要恢复的播放进度，则跳转
         if (resumeTimeRef.current && resumeTimeRef.current > 0) {
           try {
@@ -3538,6 +4254,7 @@ function PlayPageClient() {
         if (artPlayerRef.current.currentTime > 0) {
           return;
         }
+        autoSwitchToNextVerifiedSourceRef.current('播放器无法加载当前播放源');
       });
 
       // 监听视频播放结束事件，自动播放下一集
@@ -4192,7 +4909,10 @@ function PlayPageClient() {
                 availableSources={availableSources}
                 sourceSearchLoading={sourceSearchLoading}
                 sourceSearchError={sourceSearchError}
-                precomputedVideoInfo={precomputedVideoInfo}
+                sourceVideoInfoMap={sourceVideoInfoMap}
+                sourceTestingKeys={sourceTestingKeys}
+                sourceProbeProgress={sourceProbeProgress}
+                onManualSpeedTest={handleManualSourceSpeedTest}
               />
             </div>
           </div>

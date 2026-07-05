@@ -9,6 +9,8 @@ const DEFAULT_UA =
 const RESOLVE_TIMEOUT_MS = 7000;
 const MAX_REDIRECTS = 3;
 const MAX_TEXT_BYTES = 512 * 1024;
+const MAX_SCRIPT_BYTES = 256 * 1024;
+const MAX_EXTERNAL_SCRIPT_PROBES = 5;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 500;
 
@@ -111,8 +113,61 @@ function decodeHtmlEntities(value: string): string {
 function normalizeEscapedUrl(value: string): string {
   return decodeHtmlEntities(stripWrappingQuotes(value))
     .replace(/\\\//g, '/')
+    .replace(/\\x([0-9a-f]{2})/gi, (_match, hex: string) =>
+      String.fromCharCode(parseInt(hex, 16)),
+    )
+    .replace(/\\u([0-9a-f]{4})/gi, (_match, hex: string) =>
+      String.fromCharCode(parseInt(hex, 16)),
+    )
     .replace(/\\u0026/gi, '&')
     .trim();
+}
+
+function decodeURIComponentSafely(value: string): string | null {
+  try {
+    const decoded = decodeURIComponent(value);
+    return decoded !== value ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function decodeBase64Candidate(value: string): string | null {
+  const normalized = value.trim().replace(/-/g, '+').replace(/_/g, '/');
+  if (!normalized || normalized.length < 12) return null;
+  if (!/^[a-z0-9+/]+={0,2}$/i.test(normalized)) return null;
+
+  try {
+    const decoded = Buffer.from(normalized, 'base64').toString('utf8').trim();
+    if (/^(?:https?:)?\/\//i.test(decoded) || decoded.startsWith('/')) {
+      return decoded;
+    }
+  } catch {
+    // ignore non-base64 values
+  }
+
+  return null;
+}
+
+function expandCandidateVariants(value: string): string[] {
+  const variants: string[] = [];
+  const seen = new Set<string>();
+  const queue = [normalizeEscapedUrl(value)];
+
+  while (queue.length > 0) {
+    const current = queue.shift()?.trim();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    variants.push(current);
+
+    const uriDecoded = decodeURIComponentSafely(current);
+    if (uriDecoded && !seen.has(uriDecoded)) queue.push(uriDecoded);
+
+    const base64Decoded = decodeBase64Candidate(current);
+    if (base64Decoded && !seen.has(base64Decoded)) queue.push(base64Decoded);
+  }
+
+  return variants;
 }
 
 function isUnsupportedMediaCandidate(value: string): boolean {
@@ -171,15 +226,61 @@ function inferMediaTypeFromContentType(
   return 'unknown';
 }
 
-function resolveCandidate(baseUrl: string, candidate: string): string | null {
-  const normalized = normalizeEscapedUrl(candidate);
-  if (isUnsupportedMediaCandidate(normalized)) return null;
+function resolveCandidateVariants(
+  baseUrl: string,
+  candidate: string,
+): string[] {
+  const resolvedCandidates: string[] = [];
+  const seenValues = new Set<string>();
+  const queue = expandCandidateVariants(candidate);
+  const mediaParamNames = [
+    'url',
+    'play',
+    'playurl',
+    'play_url',
+    'video',
+    'videoUrl',
+    'vurl',
+    'src',
+    'file',
+    'm3u8',
+    'id',
+    'vid',
+    'path',
+  ];
 
-  try {
-    return new URL(normalized, baseUrl).toString();
-  } catch {
-    return null;
+  while (queue.length > 0) {
+    const normalized = queue.shift()?.trim();
+    if (!normalized || seenValues.has(normalized)) continue;
+    seenValues.add(normalized);
+    if (isUnsupportedMediaCandidate(normalized)) continue;
+
+    let resolved: string;
+    try {
+      resolved = new URL(normalized, baseUrl).toString();
+    } catch {
+      continue;
+    }
+
+    if (!resolvedCandidates.includes(resolved)) {
+      resolvedCandidates.push(resolved);
+    }
+
+    try {
+      const parsed = new URL(resolved);
+      for (const name of mediaParamNames) {
+        const paramValue = parsed.searchParams.get(name);
+        if (!paramValue) continue;
+        for (const variant of expandCandidateVariants(paramValue)) {
+          if (!seenValues.has(variant)) queue.push(variant);
+        }
+      }
+    } catch {
+      // ignore invalid candidate URLs
+    }
   }
+
+  return resolvedCandidates;
 }
 
 function pushCandidate(
@@ -188,11 +289,12 @@ function pushCandidate(
   candidate: string | undefined,
 ) {
   if (!candidate) return;
-  const resolved = resolveCandidate(baseUrl, candidate);
-  if (!resolved) return;
-  if (!/^https?:\/\//i.test(resolved)) return;
-  if (!candidates.includes(resolved)) {
-    candidates.push(resolved);
+  const resolvedCandidates = resolveCandidateVariants(baseUrl, candidate);
+  for (const resolved of resolvedCandidates) {
+    if (!/^https?:\/\//i.test(resolved)) continue;
+    if (!candidates.includes(resolved)) {
+      candidates.push(resolved);
+    }
   }
 }
 
@@ -204,10 +306,14 @@ export function extractPlaybackCandidatesFromHtml(
 
   const candidates: string[] = [];
   const patterns: RegExp[] = [
-    /\b(?:const|let|var)\s+(?:url|playUrl|videoUrl|m3u8|src)\s*=\s*(['"`])([^'"`]+)\1/gi,
-    /["']?(?:url|play_url|playUrl|videoUrl|m3u8)["']?\s*:\s*(['"`])([^'"`]+)\1/gi,
+    /\b(?:const|let|var)\s+(?:url|playUrl|playurl|play_url|videoUrl|video|m3u8|src|file|source)\s*=\s*(['"`])([^'"`]+)\1/gi,
+    /["']?(?:url|play_url|playUrl|playurl|videoUrl|video|m3u8|src|file|source)["']?\s*:\s*(['"`])([^'"`]+)\1/gi,
+    /\.(?:url|playUrl|playurl|play_url|videoUrl|video|m3u8|src|file|source)\s*=\s*(['"`])([^'"`]+)\1/gi,
+    /\b(?:atob|decodeURIComponent|unescape)\(\s*(['"`])([^'"`]+)\1\s*\)/gi,
     /\bhls\.loadSource\(\s*(['"`])([^'"`]+)\1\s*\)/gi,
-    /<(?:source|video|iframe)\b[^>]+src=(['"])([^'"]+)\1/gi,
+    /<(?:source|video|iframe|embed)\b[^>]+src=(['"])([^'"]+)\1/gi,
+    /<(?:source|video|meta)\b[^>]+(?:data-src|content)=(['"])([^'"]+)\1/gi,
+    /\bdata-(?:url|play-url|playurl|video-url|m3u8|src|file|source)=(['"])([^'"]+)\1/gi,
   ];
 
   for (const pattern of patterns) {
@@ -222,7 +328,37 @@ export function extractPlaybackCandidatesFromHtml(
     pushCandidate(candidates, pageUrl, match[0]);
   }
 
+  for (const match of html.matchAll(
+    /(?:https?%3a%2f%2f|%2f)[^'"<>\s]+?\.m3u8(?:%3f[^'"<>\s]*)?/gi,
+  )) {
+    pushCandidate(candidates, pageUrl, match[0]);
+  }
+
   return candidates;
+}
+
+function extractExternalScriptUrlsFromHtml(
+  html: string,
+  pageUrl: string,
+): string[] {
+  if (!html) return [];
+
+  const scripts: string[] = [];
+  for (const match of html.matchAll(/<script\b[^>]+src=(['"])([^'"]+)\1/gi)) {
+    const src = match[2];
+    if (!src || isUnsupportedMediaCandidate(src)) continue;
+
+    try {
+      const resolved = new URL(normalizeEscapedUrl(src), pageUrl).toString();
+      if (/^https?:\/\//i.test(resolved) && !scripts.includes(resolved)) {
+        scripts.push(resolved);
+      }
+    } catch {
+      // ignore invalid script urls
+    }
+  }
+
+  return scripts.slice(0, MAX_EXTERNAL_SCRIPT_PROBES);
 }
 
 export function extractPlaybackUrlFromHtml(
@@ -239,6 +375,46 @@ export function extractPlaybackUrlFromHtml(
     ) ||
     null
   );
+}
+
+async function extractPlaybackUrlFromExternalScripts(
+  html: string,
+  pageUrl: string,
+): Promise<string | null> {
+  const scriptUrls = extractExternalScriptUrlsFromHtml(html, pageUrl);
+  for (const scriptUrl of scriptUrls) {
+    try {
+      const response = await fetchWithValidatedRedirects(
+        scriptUrl,
+        {
+          cache: 'no-store',
+          headers: {
+            Accept:
+              'application/javascript,text/javascript,text/plain,*/*;q=0.5',
+            Range: `bytes=0-${MAX_SCRIPT_BYTES - 1}`,
+            Referer: pageUrl,
+            'User-Agent': DEFAULT_UA,
+          },
+        },
+        { timeoutMs: RESOLVE_TIMEOUT_MS, maxRedirects: MAX_REDIRECTS },
+      );
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        continue;
+      }
+
+      const script = await readTextWithLimit(response, MAX_SCRIPT_BYTES);
+      const extractedUrl = extractPlaybackUrlFromHtml(
+        script,
+        response.url || scriptUrl,
+      );
+      if (extractedUrl) return extractedUrl;
+    } catch {
+      // External player scripts are best-effort; keep trying the next one.
+    }
+  }
+
+  return null;
 }
 
 function extractNestedPlaybackPageUrlFromHtml(
@@ -261,7 +437,10 @@ function extractNestedPlaybackPageUrlFromHtml(
   );
 }
 
-async function readTextWithLimit(response: Response): Promise<string> {
+async function readTextWithLimit(
+  response: Response,
+  maxBytes = MAX_TEXT_BYTES,
+): Promise<string> {
   if (!response.body) return '';
 
   const reader = response.body.getReader();
@@ -274,7 +453,7 @@ async function readTextWithLimit(response: Response): Promise<string> {
     if (done) break;
 
     received += value.byteLength;
-    if (received > MAX_TEXT_BYTES) {
+    if (received > maxBytes) {
       await reader.cancel().catch(() => undefined);
       throw new Error('Playback page too large');
     }
@@ -393,6 +572,23 @@ export async function resolveExternalPlaybackUrl(
       return result;
     }
 
+    const scriptExtractedUrl = await extractPlaybackUrlFromExternalScripts(
+      html,
+      finalUrl,
+    );
+    if (scriptExtractedUrl) {
+      const result = {
+        originalUrl,
+        resolvedUrl: scriptExtractedUrl,
+        mediaType: inferMediaTypeFromUrl(scriptExtractedUrl),
+        resolved: true,
+        referer: finalUrl,
+        contentType,
+      } satisfies PlaybackUrlResolution;
+      setCached(originalUrl, result);
+      return result;
+    }
+
     const nestedPageUrl = extractNestedPlaybackPageUrlFromHtml(html, finalUrl);
     if (nestedPageUrl) {
       try {
@@ -455,6 +651,24 @@ export async function resolveExternalPlaybackUrl(
             originalUrl,
             resolvedUrl: nestedExtractedUrl,
             mediaType: inferMediaTypeFromUrl(nestedExtractedUrl),
+            resolved: true,
+            referer: nestedFinalUrl,
+            contentType: nestedContentType,
+          } satisfies PlaybackUrlResolution;
+          setCached(originalUrl, result);
+          return result;
+        }
+
+        const nestedScriptExtractedUrl =
+          await extractPlaybackUrlFromExternalScripts(
+            nestedHtml,
+            nestedFinalUrl,
+          );
+        if (nestedScriptExtractedUrl) {
+          const result = {
+            originalUrl,
+            resolvedUrl: nestedScriptExtractedUrl,
+            mediaType: inferMediaTypeFromUrl(nestedScriptExtractedUrl),
             resolved: true,
             referer: nestedFinalUrl,
             contentType: nestedContentType,

@@ -21,6 +21,8 @@ const {
 
 function textResponse(body, url = '') {
   return {
+    ok: true,
+    status: 200,
     url,
     headers: {
       get(name) {
@@ -78,6 +80,45 @@ describe('playback url resolver', () => {
     ).toBe('https://cdn.example.com/movie/index.m3u8?token=1&v=2');
   });
 
+  it('extracts HLS urls from encoded player query params', () => {
+    const html =
+      '<iframe src="/player/?url=https%3A%2F%2Fcdn.example.com%2Fmovie%2Findex.m3u8%3Ftoken%3D1"></iframe>';
+
+    expect(
+      extractPlaybackUrlFromHtml(html, 'https://site.example/share/abc'),
+    ).toBe('https://cdn.example.com/movie/index.m3u8?token=1');
+  });
+
+  it('extracts base64 encoded HLS urls from MacCMS player objects', () => {
+    const encoded = Buffer.from(
+      'https://cdn.example.com/movie/index.m3u8?token=1',
+      'utf8',
+    ).toString('base64');
+    const html = `<script>var player_aaaa={"url":"${encoded}","encrypt":2}</script>`;
+
+    expect(
+      extractPlaybackUrlFromHtml(html, 'https://site.example/share/abc'),
+    ).toBe('https://cdn.example.com/movie/index.m3u8?token=1');
+  });
+
+  it('extracts HLS urls assigned after player objects are created', () => {
+    const html =
+      '<script>MacPlayer.PlayUrl = "https://cdn.example.com/movie/index.m3u8?token=1";</script>';
+
+    expect(
+      extractPlaybackUrlFromHtml(html, 'https://site.example/share/abc'),
+    ).toBe('https://cdn.example.com/movie/index.m3u8?token=1');
+  });
+
+  it('extracts encoded HLS urls from decoder calls', () => {
+    const html =
+      '<script>var play = decodeURIComponent("https%3A%2F%2Fcdn.example.com%2Fmovie%2Findex.m3u8%3Ftoken%3D1");</script>';
+
+    expect(
+      extractPlaybackUrlFromHtml(html, 'https://site.example/share/abc'),
+    ).toBe('https://cdn.example.com/movie/index.m3u8?token=1');
+  });
+
   it('resolves HLS urls from a nested iframe player page', async () => {
     fetchWithValidatedRedirects
       .mockResolvedValueOnce(
@@ -98,6 +139,32 @@ describe('playback url resolver', () => {
       'https://site.example/media/index.m3u8?token=1',
     );
     expect(result.referer).toBe('https://site.example/player/abc');
+  });
+
+  it('resolves HLS urls from external player scripts', async () => {
+    fetchWithValidatedRedirects
+      .mockResolvedValueOnce(
+        textResponse(
+          '<script src="/static/player.js"></script>',
+          'https://site.example/share/script-abc',
+        ),
+      )
+      .mockResolvedValueOnce(
+        textResponse(
+          'window.player = {"url":"/media/index.m3u8?token=1"};',
+          'https://site.example/static/player.js',
+        ),
+      );
+
+    const result = await resolveExternalPlaybackUrl(
+      'https://site.example/share/script-abc',
+    );
+
+    expect(result.mediaType).toBe('hls');
+    expect(result.resolvedUrl).toBe(
+      'https://site.example/media/index.m3u8?token=1',
+    );
+    expect(result.referer).toBe('https://site.example/share/script-abc');
   });
 
   it('returns a Chinese message when a playback page has no media url', async () => {
